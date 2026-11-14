@@ -1,5 +1,10 @@
 # simulcast
-demonstrates of how to handle incoming track with multiple simulcast rtp streams and show all them back.
+demonstrates how to handle an incoming track with multiple simulcast RTP streams and relay them back.
+
+Instead of blindly relaying everything, a layer selector picks which simulcast layer to forward based on
+packet loss (react quickly to congestion, protecting latency) and the congestion controller's bandwidth
+estimate (recover quickly once the network improves, without oscillating between layers). See
+`layer_selector.go` for the selection logic and its tuning knobs.
 
 The browser will not send higher quality streams unless it has the available bandwidth. You can look at
 the bandwidth estimation in `chrome://webrtc-internals`. It is under `VideoBwe` when `Read Stats From: Legacy non-Standard`
@@ -28,6 +33,7 @@ Run `echo $BROWSER_SDP | simulcast`
 Copy the text that `simulcast` just emitted and copy into second text area
 
 ### Hit 'Start Session' in jsfiddle, enjoy your video!
-Your browser should send a simulcast track to Pion, and then all 3 incoming streams will be relayed back.
+Your browser should send a simulcast track to Pion. The layer selected for your current network conditions
+is relayed back, and the selected layer is printed whenever it changes.
 
 Congrats, you have used Pion WebRTC! Now start building something cool

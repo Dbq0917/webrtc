@@ -15,11 +15,24 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/cc"
+	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
+
+// Approximate average bitrates of the q/h/f simulcast layers the browser
+// sends, in bits per second. The layer selector only compares them against
+// the bandwidth estimate, so tune them to match your encoder settings.
+var simulcastLayers = []simulcastLayer{ //nolint:gochecknoglobals
+	{rid: "q", bitrate: 200_000},
+	{rid: "h", bitrate: 700_000},
+	{rid: "f", bitrate: 2_000_000},
+}
 
 // nolint:gocognit, cyclop
 func main() {
@@ -34,8 +47,38 @@ func main() {
 		},
 	}
 
+	mediaEngine := &webrtc.MediaEngine{}
+	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
+		panic(err)
+	}
+	interceptorRegistry := &interceptor.Registry{}
+
+	// Create a Congestion Controller. It estimates how much bandwidth the
+	// connection to the browser has, which the layer selector below uses to
+	// recover quickly once the network improves. Passing `nil` to
+	// gcc.NewSendSideBWE would use defaults; here we seed it with the
+	// lowest layer's bitrate so we never start by overshooting.
+	congestionController, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
+		return gcc.NewSendSideBWE(gcc.SendSideBWEInitialBitrate(simulcastLayers[0].bitrate))
+	})
+	if err != nil {
+		panic(err)
+	}
+	estimatorChan := make(chan cc.BandwidthEstimator, 1)
+	congestionController.OnNewPeerConnection(func(id string, estimator cc.BandwidthEstimator) { //nolint: revive
+		estimatorChan <- estimator
+	})
+	interceptorRegistry.Add(congestionController)
+	if err = webrtc.ConfigureTWCCHeaderExtensionSender(mediaEngine, interceptorRegistry); err != nil {
+		panic(err)
+	}
+	if err = webrtc.RegisterDefaultInterceptors(mediaEngine, interceptorRegistry); err != nil {
+		panic(err)
+	}
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine), webrtc.WithInterceptorRegistry(interceptorRegistry))
+
 	// Create a new RTCPeerConnection
-	peerConnection, err := webrtc.NewPeerConnection(config)
+	peerConnection, err := api.NewPeerConnection(config)
 	if err != nil {
 		panic(err)
 	}
@@ -112,6 +155,62 @@ func main() {
 		go processRTCP(rtpSender)
 	}
 
+	// The layerSelector decides which of the incoming simulcast layers we
+	// relay back to the browser. It is driven by packet loss (react fast,
+	// protect latency) and the congestion controller's bandwidth estimate
+	// (recover quickly without oscillating).
+	selector := newLayerSelector(simulcastLayers)
+
+	// SSRCs of the incoming simulcast streams, used to request a keyframe
+	// when we switch to a higher layer.
+	var trackSSRCsLock sync.Mutex
+	trackSSRCs := map[string]uint32{}
+
+	// Re-evaluate the selected layer a few times per second. This adds no
+	// latency to the media path: downgrades take effect on the very next
+	// packet, and upgrades only wait for the selector's dwell period.
+	go func() {
+		var estimator cc.BandwidthEstimator
+		previousLayer := 0
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			select {
+			case estimator = <-estimatorChan:
+			default:
+			}
+			bandwidthEstimate := 0
+			if estimator != nil {
+				bandwidthEstimate = estimator.GetTargetBitrate()
+			}
+
+			lossRatio := maxFractionLost(peerConnection.GetStats())
+			layer := selector.update(lossRatio, bandwidthEstimate, time.Now())
+			if layer == previousLayer {
+				continue
+			}
+			fmt.Printf("Switching to layer %q (loss=%.2f, estimate=%d bps)\n",
+				simulcastLayers[layer].rid, lossRatio, bandwidthEstimate)
+
+			if layer > previousLayer {
+				// Ask for a keyframe of the newly selected layer so the
+				// browser doesn't sit on a frozen frame until the next
+				// periodic keyframe arrives.
+				trackSSRCsLock.Lock()
+				ssrc, ok := trackSSRCs[simulcastLayers[layer].rid]
+				trackSSRCsLock.Unlock()
+				if ok {
+					if writeErr := peerConnection.WriteRTCP(
+						[]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: ssrc}},
+					); writeErr != nil {
+						fmt.Println(writeErr)
+					}
+				}
+			}
+			previousLayer = layer
+		}
+	}()
+
 	// Wait for the offer to be pasted
 	offer := webrtc.SessionDescription{}
 	decode(readUntilNewline(), &offer)
@@ -123,6 +222,9 @@ func main() {
 	// Set a handler for when a new remote track starts
 	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) { //nolint: revive
 		fmt.Println("Track has started")
+		trackSSRCsLock.Lock()
+		trackSSRCs[track.RID()] = uint32(track.SSRC())
+		trackSSRCsLock.Unlock()
 
 		// Start reading from all the streams and sending them to the related output track
 		rid := track.RID()
@@ -145,6 +247,12 @@ func main() {
 			packet, _, readErr := track.ReadRTP()
 			if readErr != nil {
 				panic(readErr)
+			}
+
+			// Only forward the layer the selector currently allows. Packets
+			// of other layers are dropped here, before they can queue up.
+			if rid != selector.currentRID() {
+				continue
 			}
 
 			if writeErr := outputTracks[rid].WriteRTP(packet); writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
@@ -199,6 +307,19 @@ func main() {
 
 	// Block forever
 	select {}
+}
+
+// maxFractionLost returns the highest fraction-lost value across all
+// outbound streams, as reported by the browser in RTCP Receiver Reports.
+func maxFractionLost(report webrtc.StatsReport) float64 {
+	maxLoss := 0.0
+	for _, stats := range report {
+		if inbound, ok := stats.(webrtc.RemoteInboundRTPStreamStats); ok && inbound.FractionLost > maxLoss {
+			maxLoss = inbound.FractionLost
+		}
+	}
+
+	return maxLoss
 }
 
 // Read from stdin until we get a newline.
